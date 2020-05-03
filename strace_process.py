@@ -1,17 +1,3 @@
-#!/usr/bin/python3
-# -*- coding: UTF-8 -*-
-"""
-Usage:
-  strace-process-tree filename
-
-Read strace -f output and produce a process tree.
-
-Recommended strace options for best results:
-
-    strace -f -e trace=process -s 1024 -o filename.out command args
-
-"""
-
 import argparse
 import os
 import re
