@@ -147,7 +147,6 @@ class ProcessTree(object):
         self.exit_time = {}   # map Process to seconds
         self.children = defaultdict(set)
         # Invariant: every Process appears exactly once in
-        # self.children[some_parent].
 
     def add_child(self, ppid, pid, name, timestamp):
         parent = self.processes.get(ppid)
@@ -259,8 +258,7 @@ class ProcessTree(object):
 
 
 def simplify_syscall(event):
-    # clone(child_stack=0x..., flags=FLAGS, parent_tidptr=..., tls=...,
-    #       child_tidptr=...) => clone(FLAGS)
+
     if event.startswith('clone('):
         event = re.sub('[(].*, flags=([^,]*), .*[)]', r'(\1)', event)
     return event.rstrip()
@@ -360,9 +358,6 @@ def parse_stream(event_stream, mogrifier=extract_command_line):
                 tree.handle_exec(e.pid, name, timestamp)
         if e.event.startswith(('clone(', 'fork(', 'vfork(')):
             args, equal, result = e.event.rpartition(' = ')
-            # if clone() fails, the event will look like this:
-            #   clone(...) = -1 EPERM (Operation not permitted)
-            # and it will fail the result.isdigit() check
             if result.isdigit():
                 child_pid = int(result)
                 name = mogrifier(args)
