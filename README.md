@@ -3,6 +3,7 @@ tool for organizing the output of a stroke command
 
 main.py takes the input file with timestamp and with -f for child process.
 for example to generate strace log file -
+
 strace -f -ttt -T -o test.out -p 3433
 
 To run the tool - 
