@@ -1,8 +1,5 @@
 import re
 import sys
-
-import strace_utils
-
 from decimal import *
 
 
