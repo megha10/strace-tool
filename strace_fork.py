@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+# -*- coding: UTF-8 -*-
 import argparse
 import os
 import re
@@ -5,6 +7,16 @@ import string
 import sys
 from collections import defaultdict, namedtuple
 from functools import partial  
+
+CHARS_FOR_SHELL = set(string.ascii_letters + string.digits + '%+,-./:=@^_~')
+REGEX_TIMESTAMP = re.compile(r'^\d+(?::\d+:\d+)?(?:\.\d+)?\s+')
+RESUMED_PREFIX = re.compile(r'<... \w+ resumed> ')
+TAG_FOR_UNFINISHED = ' <unfinished ...>'
+IGNORE = re.compile(r'^$|^strace: Process \d+ attached$')
+DURATION_SUFFIX = re.compile(r' <\d+(?:\.\d+)?>$')
+QUOTES_FOR_SHELL = CHARS_FOR_SHELL | set("!#&'()*;<>?[]{|} \t\n")
+PROCESSID = re.compile(r'^\[pid (\d+)\]')
+
 
 
 Tree = namedtuple('Tree', 'trunk, fork, end, space')
@@ -19,14 +31,7 @@ class Theme(object):
         time_range='blue',
     )
 
-    ascii_tree = Tree(
-        '  | ',
-        '  |-',
-        '  `-',
-        '    ',
-    )
-
-    unicode_tree = Tree(
+    tree_format = Tree(
         '  │ ',
         '  ├─',
         '  └─',
@@ -34,19 +39,13 @@ class Theme(object):
     )
 
     def __new__(cls, color=None, unicode=None):
-        cls = AnsiTheme
+        cls = color_set
         return object.__new__(cls)
 
-    def __init__(self, color=None, unicode=None):
-        if unicode is None:
-            unicode = self.can_unicode()
-        self.tree = self.unicode_tree if unicode else self.ascii_tree
+    def __init__(self):
+        unicode = getattr(sys.stdout, 'encoding', None) == 'UTF-8'
+        self.tree = self.tree_format
         self.styles = dict(self.default_styles)
-
-
-    @classmethod
-    def can_unicode(cls):
-        return getattr(sys.stdout, 'encoding', None) == 'UTF-8'
 
     def _format(self, prefix, suffix, text):
         if not text:
@@ -69,7 +68,7 @@ class Theme(object):
         setattr(self, attr, _format)
         return _format
 
-class AnsiTheme(Theme):
+class color_set(Theme):
 
     ctlseq = dict(
         normal='\033[m',
@@ -90,20 +89,13 @@ def parse_timestamp(timestamp):
         return float(timestamp)
 
 
-RESUMED_PREFIX = re.compile(r'<... \w+ resumed> ')
-UNFINISHED_SUFFIX = ' <unfinished ...>'
-DURATION_SUFFIX = re.compile(r' <\d+(?:\.\d+)?>$')
-PID = re.compile(r'^\[pid (\d+)\]')
-TIMESTAMP = re.compile(r'^\d+(?::\d+:\d+)?(?:\.\d+)?\s+')
-IGNORE = re.compile(r'^$|^strace: Process \d+ attached$')
-
 
 def events(stream):
     pending = {}
     for line in stream:
         line = line.strip()
         if line.startswith('[pid'):
-            line = PID.sub(r'\1', line)
+            line = PROCESSID.sub(r'\1', line)
         pid, space, event = line.partition(' ')
         try:
             pid = int(pid)
@@ -118,7 +110,7 @@ def events(stream):
         event = event.lstrip()
         timestamp = None
         if event[:1].isdigit():
-            m = TIMESTAMP.match(event)
+            m = REGEX_TIMESTAMP.match(event)
             if m is not None:
                 timestamp = parse_timestamp(m.group())
                 event = event[m.end():]
@@ -131,8 +123,8 @@ def events(stream):
             if m is not None:
                 pending_event, timestamp = pending.pop(pid)
                 event = pending_event + event[m.end():]
-        if event.endswith(UNFINISHED_SUFFIX):
-            pending[pid] = (event[:-len(UNFINISHED_SUFFIX)], timestamp)
+        if event.endswith(TAG_FOR_UNFINISHED):
+            pending[pid] = (event[:-len(TAG_FOR_UNFINISHED)], timestamp)
         else:
             yield Event(pid, timestamp, event)
 
@@ -140,38 +132,34 @@ def events(stream):
 Process = namedtuple('Process', 'pid, seq, name, parent')
 
 
-class ProcessTree(object):
+class ChildMapping(object):
     def __init__(self):
-        self.processes = {}   # map pid to Process
-        self.start_time = {}  # map Process to seconds
-        self.exit_time = {}   # map Process to seconds
+	# dictionary for processes
+        self.processes = {} 
+	# dicitonary for the start time to seconds  
+        self.start_time = {} 
+	# dicitonary for the exit time to seconds 
+        self.exit_time = {}  
+	# mapping of child processes and every process will appear only once
         self.children = defaultdict(set)
-        # Invariant: every Process appears exactly once in
 
     def add_child(self, ppid, pid, name, timestamp):
         parent = self.processes.get(ppid)
         if parent is None:
-            # This can happen when we attach to a running process and so miss
-            # the initial execve() call that would have given it a name.
+	    # for -p command .out file it's possible that the it can leave the initial call of the parent so initializing the parent.
             parent = Process(pid=ppid, seq=0, name=None, parent=None)
             self.children[None].add(parent)
-        # NB: it's possible that strace saw code executing in the child process
-        # before the parent's clone() returned a value, so we might already
-        # have a self.processes[pid].
+	# To get the previous process id as it's possible that the child process was executed before the parent's clone() returned a value
         old_process = self.processes.get(pid)
         if old_process is not None:
             self.children[old_process.parent].remove(old_process)
             child = old_process._replace(parent=parent)
         else:
-            # We pass seq=0 here and seq=1 in handle_exec() because
-            # conceptually clone() happens before execve(), but we must be
-            # ready to handle these two events in either order.
+	    # It is possible that clone can happen before execve so condition for those cases
             child = Process(pid=pid, seq=0, name=name, parent=parent)
         self.processes[pid] = child
         self.children[parent].add(child)
-        # The timestamp of clone() is always going to be earlier than the
-        # timestamp of execve() so we use unconditional assignment here but a
-        # setdefault() in handle_exec().
+	# Assigning the timestamp can be tricky because timestamp of execuve() will always be greater than clone()'s 
         self.start_time[child] = timestamp
 
     def handle_exec(self, pid, name, timestamp):
@@ -180,8 +168,7 @@ class ProcessTree(object):
             new_process = old_process._replace(seq=old_process.seq + 1,
                                                name=name)
             if old_process.seq == 0 and not self.children[old_process]:
-                # Drop the child process if it did nothing interesting between
-                # fork() and exec().
+		# removing the child process if there is nothing between the start of process and exec()
                 self.children[old_process.parent].remove(old_process)
         else:
             new_process = Process(pid=pid, seq=1, name=name, parent=None)
@@ -192,8 +179,7 @@ class ProcessTree(object):
     def handle_exit(self, pid, timestamp):
         process = self.processes.get(pid)
         if process:
-            # process may be None when we attach to a running process and
-            # see it exit before it does any clone()/execve() calls
+	    # checking for the exit time if the process is still running and its clone/execve calls
             self.exit_time[process] = timestamp
 
     def _format_time_range(self, start_time, exit_time):
@@ -203,7 +189,8 @@ class ProcessTree(object):
                 exit_time=exit_time,
                 duration=exit_time - start_time
             )
-        elif start_time:  # skip both None and 0 please
+	# condition for if start_time is None or 0 
+        elif start_time:
             return '[@{start_time:.1f}s]'.format(
                 start_time=start_time,
             )
@@ -258,31 +245,10 @@ class ProcessTree(object):
 
 
 def simplify_syscall(event):
-
+    # checking for the events which start with clone and the flags present in it
     if event.startswith('clone('):
         event = re.sub('[(].*, flags=([^,]*), .*[)]', r'(\1)', event)
     return event.rstrip()
-
-
-def extract_command_line(event):
-    # execve("/usr/bin/foo", ["foo", "bar"], [/* 45 vars */]) => foo bar
-    if event.startswith('clone('):
-        if 'CLONE_THREAD' in event:
-            return '(thread)'
-        elif 'flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD' in event:
-            return '(fork)'
-        else:
-            return '...'
-    elif event.startswith('execve('):
-        command = event.strip()
-        command = re.sub(r'^execve\([^[]*\[', '', command)
-        command = re.sub(r'\], (0x[0-9a-f]+ )?\[?/\* \d+ vars \*/\]?\)$', '',
-                         command)
-        command = parse_argv(command)
-        return format_command(command)
-    else:
-        return event.rstrip()
-
 
 ESCAPES = {
     'n': '\n',
@@ -294,56 +260,9 @@ ESCAPES = {
 }
 
 
-def parse_argv(s):
-    # '"foo", "bar"..., "baz", "\""' => ['foo', 'bar...', 'baz', '"']
-    it = iter(s + ",")
-    args = []
-    for c in it:
-        if c == ' ':
-            continue
-        assert c == '"', c
-        arg = []
-        for c in it:  # pragma: no branch -- loop will execute at least once
-            if c == '"':
-                break
-            if c == '\\':
-                c = next(it)
-                arg.append(ESCAPES.get(c, c))
-            else:
-                arg.append(c)
-        c = next(it)
-        if c == ".":
-            arg.append('...')
-            c = next(it)
-            assert c == ".", c
-            c = next(it)
-            assert c == ".", c
-            c = next(it)
-        args.append(''.join(arg))
-        assert c == ',', (c, s)
-    return args
-
-
-SHELL_SAFE_CHARS = set(string.ascii_letters + string.digits + '%+,-./:=@^_~')
-SHELL_SAFE_QUOTED = SHELL_SAFE_CHARS | set("!#&'()*;<>?[]{|} \t\n")
-
-
-def format_command(command):
-    return ' '.join(map(pushquote, (
-        arg if all(c in SHELL_SAFE_CHARS for c in arg) else
-        '"%s"' % arg if all(c in SHELL_SAFE_QUOTED for c in arg) else
-        "'%s'" % arg.replace("'", "'\\''")
-        for arg in command
-    )))
-
-
-def pushquote(arg):
-    # Change "--foo=bar" to --foo="bar" because that looks better to human eyes
-    return re.sub('''^(['"])(--[a-zA-Z0-9_-]+)=''', r'\2=\1', arg)
-
-
-def parse_stream(event_stream, mogrifier=extract_command_line):
-    tree = ProcessTree()
+# parsing the event stream and creating the Tree
+def stream_analyzer(event_stream):
+    tree = ChildMapping()
     first_timestamp = None
     for e in event_stream:
         timestamp = e.timestamp
@@ -354,25 +273,37 @@ def parse_stream(event_stream, mogrifier=extract_command_line):
         if e.event.startswith('execve('):
             args, equal, result = e.event.rpartition(' = ')
             if result == '0':
-                name = mogrifier(args)
+                name = simplify_syscall(args)
+		
                 tree.handle_exec(e.pid, name, timestamp)
         if e.event.startswith(('clone(', 'fork(', 'vfork(')):
             args, equal, result = e.event.rpartition(' = ')
+	    # checking the result.isdigit() to get not permitted operation 
             if result.isdigit():
                 child_pid = int(result)
-                name = mogrifier(args)
+                name = simplify_syscall(args)
                 tree.add_child(e.pid, child_pid, name, timestamp)
         if e.event.startswith('+++ exited with '):
             tree.handle_exit(e.pid, timestamp)
     return tree
 
+def adding_quotes(arg):
+    # Adding double quote in the command "--exec=yes" to --exec="yes"
+    return re.sub('''^(['"])(--[a-zA-Z0-9_-]+)=''', r'\2=\1', arg)
+
+def command_org(safe_command):
+    return ' '.join(map(adding_quotes, (
+        arg if all(c in CHARS_FOR_SHELL for c in arg) else
+        '"%s"' % arg if all(c in QUOTES_FOR_SHELL for c in arg) else
+        "'%s'" % arg.replace("'", "'\\''")
+        for arg in safe_command
+    )))
 
 def main():
-    tree = parse_stream(events(open(sys.argv[1], 'r')), simplify_syscall)
+    tree = stream_analyzer(events(open(sys.argv[1], 'r')))
     theme = Theme()
     print(tree.format(theme).rstrip())
 
 
 if __name__ == '__main__':
     main()
-
